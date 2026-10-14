@@ -94,6 +94,22 @@ IUpdateStore updates = !string.IsNullOrWhiteSpace(sqlConnection)
     : new DiskUpdateStore(updatesDir);
 await updates.InitializeAsync();
 
+// Cosméticos (cor do selo): no mesmo banco quando há banco, senão em memória.
+ICosmeticsStore cosmetics = !string.IsNullOrWhiteSpace(sqlConnection)
+    ? new SqlCosmeticsStore(sqlConnection, "sond_")
+    : new MemoryCosmeticsStore();
+await cosmetics.InitializeAsync();
+if (await cosmetics.IsEmptyAsync())
+{
+    // Primeira vez com cosméticos: as cores que o mod tinha fixas viram cores dadas e equipadas.
+    foreach (var (seedName, seedColor) in new[] { ("SondS_", 0xA8284D), ("kistzinho", 0x2F0B1D) })
+    {
+        await cosmetics.GrantAsync(seedName, seedColor, "SondS_");
+        await cosmetics.EquipAsync(seedName, seedColor);
+    }
+}
+var equippedCache = new EquippedCache(cosmetics);
+
 // Heartbeat é a cada 20 s; 30/min por IP sobra para várias contas atrás do mesmo NAT
 // e ainda corta quem tentar encher o banco.
 builder.Services.AddRateLimiter(options =>
@@ -150,7 +166,27 @@ app.MapPost("/presence", async (HeartbeatRequest request, HttpRequest http) =>
     }
 
     var users = await store.HeartbeatAsync(uuid.ToString(), name, server);
-    return Results.Ok(new HeartbeatResponse(users, ttl.TotalSeconds));
+
+    // Cor do selo de cada um (só quem equipou alguma).
+    var colors = new Dictionary<string, string>();
+    try
+    {
+        var equipped = await equippedCache.ForNamesAsync(users.Select(u => u.Name));
+        foreach (var user in users)
+        {
+            if (!string.IsNullOrEmpty(user.Name) && equipped.TryGetValue(CosmeticNames.Key(user.Name), out var color))
+            {
+                colors[user.Uuid] = (color & 0xFFFFFF).ToString("X6");
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        // cosmético nunca derruba a presença
+        log.LogWarning("Cores do selo indisponíveis: {Error}", ex.Message);
+    }
+
+    return Results.Ok(new HeartbeatResponse(users.Select(u => u.Uuid).ToArray(), ttl.TotalSeconds, colors));
 }).RequireRateLimiting("presence");
 
 app.MapPost("/presence/leave", async (LeaveRequest request, HttpRequest http) =>
@@ -294,6 +330,143 @@ app.MapPut("/admin/manifest", async (HttpRequest http) =>
     return Results.Ok();
 });
 
+// ---------------------------------------------------------------------------------------
+// Cosméticos: cor do ícone (selo) na tab list
+// ---------------------------------------------------------------------------------------
+
+// Quem pode dar/tirar cores. Padrão: o dono do client.
+var cosmeticAdmins = (builder.Configuration["Cosmetics:Admins"] is { Length: > 0 } admins ? admins : "SondS_")
+    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+    .Select(CosmeticNames.Key)
+    .ToHashSet();
+var cosmeticsAuth = new CosmeticsAuth(builder.Configuration["Cosmetics:TokenSecret"], log);
+var nickPattern = new Regex("^[A-Za-z0-9_]{1,16}$", RegexOptions.Compiled);
+
+string ColorHex(int rgb) => (rgb & 0xFFFFFF).ToString("X6");
+
+int? ParseColor(string? text)
+{
+    if (string.IsNullOrWhiteSpace(text))
+    {
+        return null;
+    }
+
+    var t = text.Trim().TrimStart('#');
+    if (t.Length == 3)
+    {
+        t = string.Concat(t.Select(c => $"{c}{c}"));
+    }
+
+    return t.Length == 6 && int.TryParse(t, System.Globalization.NumberStyles.HexNumber, null, out var v) ? v : null;
+}
+
+string? SessionName(HttpRequest http) => cosmeticsAuth.ReadToken(http.Headers["X-Sond-Session"].ToString());
+
+bool IsCosmeticAdmin(string? name) => name is not null && cosmeticAdmins.Contains(CosmeticNames.Key(name));
+
+async Task<object> CosmeticsView(string name)
+{
+    var owned = await cosmetics.OwnedAsync(name);
+    var equipped = await cosmetics.EquippedAsync(name);
+    return new
+    {
+        name,
+        owned = owned.Select(ColorHex).ToArray(),
+        equipped = equipped is null ? null : ColorHex(equipped.Value)
+    };
+}
+
+app.MapGet("/cosmetics/challenge", () => Results.Ok(new { serverId = cosmeticsAuth.NewChallenge() }))
+    .RequireRateLimiting("presence");
+
+app.MapPost("/cosmetics/auth", async (CosmeticsAuthRequest request) =>
+{
+    if (!nickPattern.IsMatch(request.Name ?? "") || string.IsNullOrWhiteSpace(request.ServerId))
+    {
+        return Results.BadRequest(new { error = "pedido inválido" });
+    }
+
+    var verified = await cosmeticsAuth.VerifyAsync(request.Name!, request.ServerId!);
+    if (verified is null)
+    {
+        return Results.Unauthorized();
+    }
+
+    var name = verified.Value.Name;
+    return Results.Ok(new { token = cosmeticsAuth.IssueToken(name), name, admin = IsCosmeticAdmin(name) });
+}).RequireRateLimiting("presence");
+
+// Público: as cores de um jogador (o mod mostra só as do próprio jogador; o admin consulta qualquer um).
+app.MapGet("/cosmetics/user/{name}", async (string name) =>
+        nickPattern.IsMatch(name) ? Results.Ok(await CosmeticsView(name)) : Results.BadRequest(new { error = "nick inválido" }))
+    .RequireRateLimiting("presence");
+
+app.MapPost("/cosmetics/equip", async (CosmeticsEquipRequest request, HttpRequest http) =>
+{
+    var name = SessionName(http);
+    if (name is null)
+    {
+        return Results.Unauthorized();
+    }
+
+    int? color = null;
+    if (!string.IsNullOrWhiteSpace(request.Color))
+    {
+        color = ParseColor(request.Color);
+        if (color is null)
+        {
+            return Results.BadRequest(new { error = "cor inválida" });
+        }
+    }
+
+    if (!await cosmetics.EquipAsync(name, color))
+    {
+        return Results.BadRequest(new { error = "você não tem essa cor" });
+    }
+
+    equippedCache.Invalidate();
+    return Results.Ok(await CosmeticsView(name));
+}).RequireRateLimiting("presence");
+
+app.MapPost("/cosmetics/admin/grant", async (CosmeticsGrantRequest request, HttpRequest http) =>
+{
+    var admin = SessionName(http);
+    if (!IsCosmeticAdmin(admin))
+    {
+        return Results.Unauthorized();
+    }
+
+    var color = ParseColor(request.Color);
+    if (!nickPattern.IsMatch(request.Target ?? "") || color is null)
+    {
+        return Results.BadRequest(new { error = "nick ou cor inválidos" });
+    }
+
+    await cosmetics.GrantAsync(request.Target!, color.Value, admin!);
+    log.LogInformation("{Admin} deu a cor #{Color} para {Target}", admin, ColorHex(color.Value), request.Target);
+    return Results.Ok(await CosmeticsView(request.Target!));
+}).RequireRateLimiting("presence");
+
+app.MapPost("/cosmetics/admin/revoke", async (CosmeticsGrantRequest request, HttpRequest http) =>
+{
+    var admin = SessionName(http);
+    if (!IsCosmeticAdmin(admin))
+    {
+        return Results.Unauthorized();
+    }
+
+    var color = ParseColor(request.Color);
+    if (!nickPattern.IsMatch(request.Target ?? "") || color is null)
+    {
+        return Results.BadRequest(new { error = "nick ou cor inválidos" });
+    }
+
+    await cosmetics.RevokeAsync(request.Target!, color.Value);
+    equippedCache.Invalidate();
+    log.LogInformation("{Admin} tirou a cor #{Color} de {Target}", admin, ColorHex(color.Value), request.Target);
+    return Results.Ok(await CosmeticsView(request.Target!));
+}).RequireRateLimiting("presence");
+
 app.MapGet("/", () => Results.Text("Sond Client — ok"));
 
 app.Run();
@@ -319,4 +492,31 @@ internal sealed class LeaveRequest
 
 internal sealed record HeartbeatResponse(
     [property: JsonPropertyName("users")] string[] Users,
-    [property: JsonPropertyName("ttlSeconds")] double TtlSeconds);
+    [property: JsonPropertyName("ttlSeconds")] double TtlSeconds,
+    // uuid → "RRGGBB": cor do selo de quem equipou uma.
+    [property: JsonPropertyName("colors")] Dictionary<string, string> Colors);
+
+internal sealed class CosmeticsAuthRequest
+{
+    [JsonPropertyName("name")]
+    public string? Name { get; set; }
+
+    [JsonPropertyName("serverId")]
+    public string? ServerId { get; set; }
+}
+
+internal sealed class CosmeticsEquipRequest
+{
+    /// <summary>"RRGGBB"; vazio/null = volta ao selo padrão.</summary>
+    [JsonPropertyName("color")]
+    public string? Color { get; set; }
+}
+
+internal sealed class CosmeticsGrantRequest
+{
+    [JsonPropertyName("target")]
+    public string? Target { get; set; }
+
+    [JsonPropertyName("color")]
+    public string? Color { get; set; }
+}

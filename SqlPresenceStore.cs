@@ -63,7 +63,7 @@ public sealed class SqlPresenceStore : IPresenceStore
 
     private long Cutoff() => NowMs() - (long)_ttl.TotalMilliseconds;
 
-    public async Task<string[]> HeartbeatAsync(string uuid, string name, string server)
+    public async Task<PresenceUser[]> HeartbeatAsync(string uuid, string name, string server)
     {
         await using var connection = await OpenAsync();
 
@@ -80,9 +80,9 @@ public sealed class SqlPresenceStore : IPresenceStore
             await upsert.ExecuteNonQueryAsync();
         }
 
-        var users = new List<string>();
+        var users = new List<PresenceUser>();
         await using (var select = new MySqlCommand(
-            $"SELECT uuid FROM `{_table}` WHERE server = @server AND last_seen >= @cutoff", connection))
+            $"SELECT uuid, name FROM `{_table}` WHERE server = @server AND last_seen >= @cutoff", connection))
         {
             select.Parameters.AddWithValue("@server", server);
             select.Parameters.AddWithValue("@cutoff", Cutoff());
@@ -90,7 +90,7 @@ public sealed class SqlPresenceStore : IPresenceStore
             while (await reader.ReadAsync())
             {
                 // O MySqlConnector entrega CHAR(36) como Guid; ToString() volta ao formato do mod.
-                users.Add(reader.GetValue(0).ToString()!);
+                users.Add(new PresenceUser(reader.GetValue(0).ToString()!, reader.GetString(1)));
             }
         }
 

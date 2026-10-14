@@ -10,8 +10,8 @@ namespace SondPresence;
 /// </summary>
 public interface IPresenceStore
 {
-    /// <summary>Registra o heartbeat e devolve os UUIDs de quem está no mesmo servidor.</summary>
-    Task<string[]> HeartbeatAsync(string uuid, string name, string server);
+    /// <summary>Registra o heartbeat e devolve quem está no mesmo servidor (uuid + nick).</summary>
+    Task<PresenceUser[]> HeartbeatAsync(string uuid, string name, string server);
 
     Task LeaveAsync(string uuid);
 
@@ -19,6 +19,8 @@ public interface IPresenceStore
 }
 
 public sealed record PresenceStats(long Total, Dictionary<string, long> PorServidor);
+
+public sealed record PresenceUser(string Uuid, string Name);
 
 public sealed class RedisPresenceStore : IPresenceStore
 {
@@ -42,7 +44,7 @@ public sealed class RedisPresenceStore : IPresenceStore
     private RedisKey OnlineKey => $"{_prefix}online";
     private RedisKey ServersKey => $"{_prefix}servers";
 
-    public async Task<string[]> HeartbeatAsync(string uuid, string name, string server)
+    public async Task<PresenceUser[]> HeartbeatAsync(string uuid, string name, string server)
     {
         var db = _redis.GetDatabase();
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -70,7 +72,14 @@ public sealed class RedisPresenceStore : IPresenceStore
         batch.Execute();
 
         await Task.WhenAll(tasks);
-        return (await members).Select(m => m.ToString()).ToArray();
+        var uuids = (await members).Select(m => m.ToString()).ToArray();
+
+        // Nick de cada um (para a cor do selo); quem expirou entre uma chamada e outra vem sem nome.
+        var names = db.CreateBatch();
+        var lookups = uuids.Select(u => names.HashGetAsync(UserKey(u), "name")).ToArray();
+        names.Execute();
+        var values = await Task.WhenAll(lookups);
+        return uuids.Select((u, i) => new PresenceUser(u, values[i].HasValue ? values[i].ToString() : "")).ToArray();
     }
 
     public async Task LeaveAsync(string uuid)
@@ -134,11 +143,11 @@ public sealed class MemoryPresenceStore : IPresenceStore
         }
     }
 
-    public Task<string[]> HeartbeatAsync(string uuid, string name, string server)
+    public Task<PresenceUser[]> HeartbeatAsync(string uuid, string name, string server)
     {
         Sweep();
         _online[uuid] = new Entry(uuid, name, server, DateTimeOffset.UtcNow);
-        return Task.FromResult(_online.Values.Where(e => e.Server == server).Select(e => e.Uuid).ToArray());
+        return Task.FromResult(_online.Values.Where(e => e.Server == server).Select(e => new PresenceUser(e.Uuid, e.Name)).ToArray());
     }
 
     public Task LeaveAsync(string uuid)

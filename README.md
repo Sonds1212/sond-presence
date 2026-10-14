@@ -60,6 +60,20 @@ Os arquivos publicados ficam em `updates/` ao lado do executável: mantenha essa
 | `Presence:ApiKey` | Se preenchido, o mod precisa mandar o mesmo valor em `X-Sond-Key` |
 | `Updates:Directory` | Onde guardar as versões publicadas (padrão `updates/`) |
 | `Updates:AdminToken` | Token para publicar. **O mesmo** do `publish.config.json` na raiz do projeto |
+| `Cosmetics:Admins` | Nicks que podem dar/tirar cores do ícone (padrão `SondS_`; vários separados por vírgula) |
+| `Cosmetics:TokenSecret` | Opcional. Segredo das sessões de cosméticos; sem ele, reiniciar o serviço só pede login de novo |
+
+## Cosméticos (cor do ícone na TAB)
+
+- `GET /cosmetics/user/{nick}`: cores que o jogador tem e a equipada (público).
+- `GET /cosmetics/challenge` + `POST /cosmetics/auth`: login pela conta Minecraft — o mod avisa a Mojang
+  (como ao entrar num servidor original) e o serviço confere em `hasJoined`. Devolve um token de 6 h.
+- `POST /cosmetics/equip` (header `X-Sond-Session`): equipa uma cor que o jogador tem.
+- `POST /cosmetics/admin/grant` e `/cosmetics/admin/revoke`: só para os nicks de `Cosmetics:Admins`.
+- O heartbeat de presença devolve `colors` (uuid → `RRGGBB`) e o mod pinta o selo de cada um.
+
+Tabelas (criadas sozinhas): `sond_cosmetic_colors` e `sond_cosmetic_equipped`. Na primeira vez, as cores
+que eram fixas no mod viram cores dadas e equipadas (SondS_ `#A8284D`, kistzinho `#2F0B1D`).
 
 O endereço público do serviço vai em `publish.config.json` (`serviceUrl`), na raiz do projeto.
 O `build.ps1` embute esse endereço no launcher, e o launcher configura o mod de cada instância
