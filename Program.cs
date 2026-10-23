@@ -272,6 +272,15 @@ app.MapGet("/download/linux", async () =>
         ? Results.NotFound("Nenhum pacote Linux publicado ainda.")
         : Results.Redirect($"/updates/files/{installer.Value.Sha}/{installer.Value.Name}");
 });
+// AppImage: um arquivo só que roda em qualquer distro (Arch, Fedora, ...), sem instalar nada.
+app.MapGet("/download/appimage", async () =>
+{
+    var manifest = await updates.ReadManifestAsync(UpdatePlatforms.Linux);
+    var appImage = manifest is null ? null : ManifestReader.Download(manifest, ".AppImage");
+    return appImage is null
+        ? Results.NotFound("Nenhum AppImage publicado ainda.")
+        : Results.Redirect($"/updates/files/{appImage.Value.Sha}/{appImage.Value.Name}");
+});
 app.MapGet("/download/linux.sh", async (HttpRequest request) =>
 {
     var script = await File.ReadAllTextAsync(Path.Combine(linuxDir, "install.sh"));

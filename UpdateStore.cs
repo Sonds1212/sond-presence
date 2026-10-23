@@ -424,7 +424,47 @@ public static class ManifestReader
             result.Add(Entry(installer));
         }
 
+        if (manifest.RootElement.TryGetProperty("downloads", out var downloads) &&
+            downloads.ValueKind == System.Text.Json.JsonValueKind.Array)
+        {
+            foreach (var file in downloads.EnumerateArray())
+            {
+                result.Add(Entry(file));
+            }
+        }
+
         return result;
+    }
+
+    /// <summary>Pacote extra da lista "downloads" com a extensão pedida (ex.: ".AppImage").</summary>
+    public static (string Sha, string Name)? Download(string envelopeJson, string extension)
+    {
+        try
+        {
+            using var envelope = System.Text.Json.JsonDocument.Parse(envelopeJson);
+            var payload = Convert.FromBase64String(envelope.RootElement.GetProperty("manifest").GetString()!);
+            using var manifest = System.Text.Json.JsonDocument.Parse(payload);
+            if (!manifest.RootElement.TryGetProperty("downloads", out var downloads) ||
+                downloads.ValueKind != System.Text.Json.JsonValueKind.Array)
+            {
+                return null;
+            }
+
+            foreach (var file in downloads.EnumerateArray())
+            {
+                var entry = Entry(file);
+                if (entry.Item2.EndsWith(extension, StringComparison.OrdinalIgnoreCase))
+                {
+                    return entry;
+                }
+            }
+
+            return null;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static (string, string) Entry(System.Text.Json.JsonElement file) =>

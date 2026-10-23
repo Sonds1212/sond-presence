@@ -68,8 +68,10 @@ VERSION="$(sed -n 's/.*"version":"\([^"]*\)".*/\1/p' "$WORK/manifest.json")"
 say "Versão $VERSION (assinatura conferida)."
 
 mkdir -p "$APP_DIR"
-# Um arquivo por linha: caminho<TAB>sha256
+# Um arquivo por linha: caminho<TAB>sha256. Só a lista "files" (o app): "installer" e "downloads"
+# são os pacotes .deb/.AppImage, que não vão para dentro da pasta do launcher.
 sed -e 's#[\]/#/#g' "$WORK/manifest.json" \
+    | sed -n 's/.*"files":\[\([^]]*\)\].*/\1/p' \
     | grep -o '"path":"[^"]*","sha256":"[0-9a-f]\{64\}"' \
     | sed 's/"path":"\([^"]*\)","sha256":"\([0-9a-f]*\)"/\1\t\2/' > "$WORK/files.tsv"
 [ -s "$WORK/files.tsv" ] || fail "Lista de arquivos vazia."
