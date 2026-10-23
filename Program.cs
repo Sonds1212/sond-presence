@@ -368,11 +368,13 @@ async Task<object> CosmeticsView(string name)
 {
     var owned = await cosmetics.OwnedAsync(name);
     var equipped = await cosmetics.EquippedAsync(name);
+    var coins = await cosmetics.CoinsAsync(name);
     return new
     {
         name,
         owned = owned.Select(ColorHex).ToArray(),
-        equipped = equipped is null ? null : ColorHex(equipped.Value)
+        equipped = equipped is null ? null : ColorHex(equipped.Value),
+        coins
     };
 }
 
@@ -467,9 +469,81 @@ app.MapPost("/cosmetics/admin/revoke", async (CosmeticsGrantRequest request, Htt
     return Results.Ok(await CosmeticsView(request.Target!));
 }).RequireRateLimiting("presence");
 
+// ---------------------------------------------------------------------------------------
+// Loja: itens pagos com as coins do client. O admin dá coins; o jogador compra.
+// ---------------------------------------------------------------------------------------
+
+app.MapGet("/shop", () => Results.Ok(new
+{
+    items = ShopCatalog.Items.Select(i => new { id = i.Id, name = i.Name, kind = i.Kind, color = ColorHex(i.Color), price = i.Price })
+})).RequireRateLimiting("presence");
+
+app.MapPost("/shop/buy", async (ShopBuyRequest request, HttpRequest http) =>
+{
+    var name = SessionName(http);
+    if (name is null)
+    {
+        return Results.Unauthorized();
+    }
+
+    var item = ShopCatalog.Find(request.Item);
+    if (item is null)
+    {
+        return Results.BadRequest(new { error = "item não existe" });
+    }
+
+    var result = await cosmetics.BuyColorAsync(name, item.Color, item.Price, item.Id);
+    if (result == PurchaseResult.AlreadyOwned)
+    {
+        return Results.BadRequest(new { error = "você já tem esse item" });
+    }
+
+    if (result == PurchaseResult.NotEnoughCoins)
+    {
+        return Results.BadRequest(new { error = "coins insuficientes" });
+    }
+
+    log.LogInformation("{Name} comprou {Item} por {Price} coins", name, item.Id, item.Price);
+    return Results.Ok(await CosmeticsView(name));
+}).RequireRateLimiting("presence");
+
+app.MapPost("/cosmetics/admin/coins", async (CosmeticsCoinsRequest request, HttpRequest http) =>
+{
+    var admin = SessionName(http);
+    if (!IsCosmeticAdmin(admin))
+    {
+        return Results.Unauthorized();
+    }
+
+    if (!nickPattern.IsMatch(request.Target ?? "") || request.Amount == 0 || Math.Abs(request.Amount) > 1_000_000)
+    {
+        return Results.BadRequest(new { error = "nick ou quantidade inválidos" });
+    }
+
+    var balance = await cosmetics.AddCoinsAsync(request.Target!, request.Amount, "admin:" + admin);
+    log.LogInformation("{Admin} mudou {Amount} coins de {Target} (saldo {Balance})", admin, request.Amount, request.Target, balance);
+    return Results.Ok(await CosmeticsView(request.Target!));
+}).RequireRateLimiting("presence");
+
 app.MapGet("/", () => Results.Text("Sond Client — ok"));
 
 app.Run();
+
+internal sealed class ShopBuyRequest
+{
+    [JsonPropertyName("item")]
+    public string? Item { get; set; }
+}
+
+internal sealed class CosmeticsCoinsRequest
+{
+    [JsonPropertyName("target")]
+    public string? Target { get; set; }
+
+    /// <summary>Quanto somar (negativo tira).</summary>
+    [JsonPropertyName("amount")]
+    public long Amount { get; set; }
+}
 
 internal sealed class HeartbeatRequest
 {

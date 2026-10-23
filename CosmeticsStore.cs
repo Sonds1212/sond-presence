@@ -31,6 +31,22 @@ public interface ICosmeticsStore
 
     /// <summary>Equipa (ou tira, com null). Só aceita cor que o jogador tem.</summary>
     Task<bool> EquipAsync(string name, int? color);
+
+    /// <summary>Coins do client que o jogador tem.</summary>
+    Task<long> CoinsAsync(string name);
+
+    /// <summary>Soma (ou tira, com negativo) coins; nunca deixa o saldo abaixo de zero. Devolve o saldo novo.</summary>
+    Task<long> AddCoinsAsync(string name, long delta, string reason);
+
+    /// <summary>Compra uma cor: desconta o preço e dá a cor numa transação só.</summary>
+    Task<PurchaseResult> BuyColorAsync(string name, int color, long price, string itemId);
+}
+
+public enum PurchaseResult
+{
+    Ok,
+    AlreadyOwned,
+    NotEnoughCoins
 }
 
 public static class CosmeticNames
@@ -101,12 +117,16 @@ public sealed class SqlCosmeticsStore : ICosmeticsStore
     private readonly string _connectionString;
     private readonly string _owned;
     private readonly string _equipped;
+    private readonly string _coins;
+    private readonly string _coinLog;
 
     public SqlCosmeticsStore(string connectionString, string prefix)
     {
         _connectionString = connectionString;
         _owned = prefix + "cosmetic_colors";
         _equipped = prefix + "cosmetic_equipped";
+        _coins = prefix + "coins";
+        _coinLog = prefix + "coin_log";
     }
 
     private async Task<MySqlConnection> OpenAsync()
@@ -138,6 +158,31 @@ public sealed class SqlCosmeticsStore : ICosmeticsStore
             CREATE TABLE IF NOT EXISTS `{_equipped}` (
                 name  VARCHAR(16) NOT NULL PRIMARY KEY,
                 color INT         NOT NULL
+            )
+            """, connection))
+        {
+            await create.ExecuteNonQueryAsync();
+        }
+
+        await using (var create = new MySqlCommand($"""
+            CREATE TABLE IF NOT EXISTS `{_coins}` (
+                name    VARCHAR(16) NOT NULL PRIMARY KEY,
+                balance BIGINT      NOT NULL DEFAULT 0
+            )
+            """, connection))
+        {
+            await create.ExecuteNonQueryAsync();
+        }
+
+        // Histórico de toda entrada/saída de coins (admin, compras), para conferir depois.
+        await using (var create = new MySqlCommand($"""
+            CREATE TABLE IF NOT EXISTS `{_coinLog}` (
+                id     BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                name   VARCHAR(16) NOT NULL,
+                delta  BIGINT      NOT NULL,
+                reason VARCHAR(64) NOT NULL,
+                at     BIGINT      NOT NULL,
+                KEY idx_name (name)
             )
             """, connection))
         {
@@ -266,6 +311,97 @@ public sealed class SqlCosmeticsStore : ICosmeticsStore
         await upsert.ExecuteNonQueryAsync();
         return true;
     }
+
+    public async Task<long> CoinsAsync(string name)
+    {
+        await using var connection = await OpenAsync();
+        await using var select = new MySqlCommand($"SELECT balance FROM `{_coins}` WHERE name = @name", connection);
+        select.Parameters.AddWithValue("@name", CosmeticNames.Key(name));
+        var value = await select.ExecuteScalarAsync();
+        return value is null or DBNull ? 0 : Convert.ToInt64(value);
+    }
+
+    public async Task<long> AddCoinsAsync(string name, long delta, string reason)
+    {
+        var key = CosmeticNames.Key(name);
+        await using var connection = await OpenAsync();
+        await using var tx = await connection.BeginTransactionAsync();
+
+        await using (var upsert = new MySqlCommand($"""
+            INSERT INTO `{_coins}` (name, balance) VALUES (@name, GREATEST(@delta, 0))
+            ON DUPLICATE KEY UPDATE balance = GREATEST(balance + @delta, 0)
+            """, connection, tx))
+        {
+            upsert.Parameters.AddWithValue("@name", key);
+            upsert.Parameters.AddWithValue("@delta", delta);
+            await upsert.ExecuteNonQueryAsync();
+        }
+
+        await LogAsync(connection, tx, key, delta, reason);
+        long balance;
+        await using (var select = new MySqlCommand($"SELECT balance FROM `{_coins}` WHERE name = @name", connection, tx))
+        {
+            select.Parameters.AddWithValue("@name", key);
+            balance = Convert.ToInt64(await select.ExecuteScalarAsync());
+        }
+
+        await tx.CommitAsync();
+        return balance;
+    }
+
+    public async Task<PurchaseResult> BuyColorAsync(string name, int color, long price, string itemId)
+    {
+        var key = CosmeticNames.Key(name);
+        await using var connection = await OpenAsync();
+        await using var tx = await connection.BeginTransactionAsync();
+
+        await using (var check = new MySqlCommand($"SELECT 1 FROM `{_owned}` WHERE name = @name AND color = @color", connection, tx))
+        {
+            check.Parameters.AddWithValue("@name", key);
+            check.Parameters.AddWithValue("@color", color);
+            if (await check.ExecuteScalarAsync() is not null)
+            {
+                return PurchaseResult.AlreadyOwned;
+            }
+        }
+
+        // Só desconta se o saldo cobre o preço; 0 linhas = sem coins suficientes.
+        await using (var pay = new MySqlCommand(
+                   $"UPDATE `{_coins}` SET balance = balance - @price WHERE name = @name AND balance >= @price", connection, tx))
+        {
+            pay.Parameters.AddWithValue("@name", key);
+            pay.Parameters.AddWithValue("@price", price);
+            if (price > 0 && await pay.ExecuteNonQueryAsync() == 0)
+            {
+                return PurchaseResult.NotEnoughCoins;
+            }
+        }
+
+        await using (var insert = new MySqlCommand($"""
+            INSERT INTO `{_owned}` (name, color, granted_by, granted_at) VALUES (@name, @color, 'loja', @now)
+            """, connection, tx))
+        {
+            insert.Parameters.AddWithValue("@name", key);
+            insert.Parameters.AddWithValue("@color", color);
+            insert.Parameters.AddWithValue("@now", NowMs());
+            await insert.ExecuteNonQueryAsync();
+        }
+
+        await LogAsync(connection, tx, key, -price, "loja:" + itemId);
+        await tx.CommitAsync();
+        return PurchaseResult.Ok;
+    }
+
+    private async Task LogAsync(MySqlConnection connection, MySqlTransaction tx, string key, long delta, string reason)
+    {
+        await using var log = new MySqlCommand(
+            $"INSERT INTO `{_coinLog}` (name, delta, reason, at) VALUES (@name, @delta, @reason, @now)", connection, tx);
+        log.Parameters.AddWithValue("@name", key);
+        log.Parameters.AddWithValue("@delta", delta);
+        log.Parameters.AddWithValue("@reason", reason.Length > 64 ? reason[..64] : reason);
+        log.Parameters.AddWithValue("@now", NowMs());
+        await log.ExecuteNonQueryAsync();
+    }
 }
 
 /// <summary>Sem banco (teste local): some ao reiniciar.</summary>
@@ -347,5 +483,37 @@ public sealed class MemoryCosmeticsStore : ICosmeticsStore
 
         _equipped[key] = color.Value;
         return Task.FromResult(true);
+    }
+
+    private readonly ConcurrentDictionary<string, long> _coins = new();
+
+    public Task<long> CoinsAsync(string name) =>
+        Task.FromResult(_coins.GetValueOrDefault(CosmeticNames.Key(name)));
+
+    public Task<long> AddCoinsAsync(string name, long delta, string reason) =>
+        Task.FromResult(_coins.AddOrUpdate(CosmeticNames.Key(name), Math.Max(delta, 0), (_, b) => Math.Max(b + delta, 0)));
+
+    public Task<PurchaseResult> BuyColorAsync(string name, int color, long price, string itemId)
+    {
+        var key = CosmeticNames.Key(name);
+        lock (_owned)
+        {
+            var list = _owned.GetOrAdd(key, _ => new List<int>());
+            if (list.Contains(color))
+            {
+                return Task.FromResult(PurchaseResult.AlreadyOwned);
+            }
+
+            var balance = _coins.GetValueOrDefault(key);
+            if (balance < price)
+            {
+                return Task.FromResult(PurchaseResult.NotEnoughCoins);
+            }
+
+            _coins[key] = balance - price;
+            list.Add(color);
+        }
+
+        return Task.FromResult(PurchaseResult.Ok);
     }
 }
