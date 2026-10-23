@@ -21,10 +21,24 @@ public interface IUpdateStore
     /// <summary>Caminho local do arquivo para servir (o banco materializa num cache em disco).</summary>
     Task<string?> GetLocalPathAsync(string sha, string name, CancellationToken ct);
 
-    Task<string?> ReadManifestAsync();
+    /// <summary>Manifesto atual da plataforma ("windows" ou "linux").</summary>
+    Task<string?> ReadManifestAsync(string platform = UpdatePlatforms.Windows);
 
-    /// <summary>Publica o manifesto e apaga arquivos que nenhuma das duas últimas versões usa.</summary>
-    Task WriteManifestAsync(string body, IReadOnlyCollection<string> referencedShas);
+    /// <summary>
+    /// Publica o manifesto da plataforma e apaga arquivos que nenhuma das duas últimas versões
+    /// de NENHUMA plataforma usa (publicar o Linux não pode apagar o que o Windows baixa).
+    /// </summary>
+    Task WriteManifestAsync(string body, IReadOnlyCollection<string> referencedShas, string platform = UpdatePlatforms.Windows);
+}
+
+public static class UpdatePlatforms
+{
+    public const string Windows = "windows";
+    public const string Linux = "linux";
+
+    public static readonly string[] All = [Windows, Linux];
+
+    public static bool IsValid(string? platform) => platform is Windows or Linux;
 }
 
 internal static class HashHelper
@@ -34,14 +48,18 @@ internal static class HashHelper
 
 public sealed class DiskUpdateStore : IUpdateStore
 {
+    private readonly string _directory;
     private readonly string _filesDir;
-    private readonly string _manifestPath;
 
     public DiskUpdateStore(string directory)
     {
+        _directory = directory;
         _filesDir = Path.Combine(directory, "files");
-        _manifestPath = Path.Combine(directory, "manifest.json");
     }
+
+    /// <summary>manifest.json (Windows, o de sempre) ou manifest-linux.json.</summary>
+    private string ManifestPath(string platform) =>
+        Path.Combine(_directory, platform == UpdatePlatforms.Windows ? "manifest.json" : $"manifest-{platform}.json");
 
     public Task InitializeAsync()
     {
@@ -90,14 +108,15 @@ public sealed class DiskUpdateStore : IUpdateStore
         return Task.FromResult(File.Exists(path) ? path : null);
     }
 
-    public async Task<string?> ReadManifestAsync() =>
-        File.Exists(_manifestPath) ? await File.ReadAllTextAsync(_manifestPath) : null;
+    public async Task<string?> ReadManifestAsync(string platform = UpdatePlatforms.Windows) =>
+        File.Exists(ManifestPath(platform)) ? await File.ReadAllTextAsync(ManifestPath(platform)) : null;
 
-    public async Task WriteManifestAsync(string body, IReadOnlyCollection<string> referencedShas)
+    public async Task WriteManifestAsync(string body, IReadOnlyCollection<string> referencedShas, string platform = UpdatePlatforms.Windows)
     {
-        var temp = _manifestPath + ".tmp";
+        var path = ManifestPath(platform);
+        var temp = path + ".tmp";
         await File.WriteAllTextAsync(temp, body);
-        File.Move(temp, _manifestPath, overwrite: true);
+        File.Move(temp, path, overwrite: true);
     }
 }
 
@@ -172,6 +191,18 @@ public sealed class SqlUpdateStore : IUpdateStore
                 KEY idx_published (published)
             )
             """);
+
+        // Manifestos por plataforma: tabelas antigas (só Windows) ganham a coluna.
+        await using (var check = new MySqlCommand(
+                   "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = @t AND column_name = 'platform'",
+                   connection))
+        {
+            check.Parameters.AddWithValue("@t", _prefix + "update_manifests");
+            if (Convert.ToInt64(await check.ExecuteScalarAsync()) == 0)
+            {
+                await ExecAsync(connection, $"ALTER TABLE {Manifests} ADD COLUMN platform VARCHAR(16) NOT NULL DEFAULT 'windows'");
+            }
+        }
     }
 
     public async Task<bool> HasFileAsync(string sha)
@@ -297,26 +328,33 @@ public sealed class SqlUpdateStore : IUpdateStore
         }
     }
 
-    public async Task<string?> ReadManifestAsync()
+    public async Task<string?> ReadManifestAsync(string platform = UpdatePlatforms.Windows)
     {
         await using var connection = await OpenAsync();
-        await using var command = new MySqlCommand($"SELECT body FROM {Manifests} ORDER BY published DESC LIMIT 1", connection);
+        await using var command = new MySqlCommand(
+            $"SELECT body FROM {Manifests} WHERE platform = @p ORDER BY published DESC LIMIT 1", connection);
+        command.Parameters.AddWithValue("@p", platform);
         return await command.ExecuteScalarAsync() as string;
     }
 
-    public async Task WriteManifestAsync(string body, IReadOnlyCollection<string> referencedShas)
+    public async Task WriteManifestAsync(string body, IReadOnlyCollection<string> referencedShas, string platform = UpdatePlatforms.Windows)
     {
         await using var connection = await OpenAsync();
-        await ExecAsync(connection, $"INSERT INTO {Manifests} (body, published) VALUES (@body, @now)",
-            ("@body", body), ("@now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
+        await ExecAsync(connection, $"INSERT INTO {Manifests} (body, published, platform) VALUES (@body, @now, @p)",
+            ("@body", body), ("@now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()), ("@p", platform));
 
-        // Guarda a versão anterior também: quem está no meio de uma atualização ainda baixa dela.
+        // Guarda as duas últimas versões de cada plataforma: quem está no meio de uma atualização
+        // ainda baixa da anterior, e publicar uma plataforma não apaga os arquivos da outra.
         var keep = new HashSet<string>(referencedShas, StringComparer.OrdinalIgnoreCase);
-        await using (var previous = new MySqlCommand($"SELECT body FROM {Manifests} ORDER BY published DESC LIMIT 1 OFFSET 1", connection))
+        foreach (var p in UpdatePlatforms.All)
         {
-            if (await previous.ExecuteScalarAsync() is string previousBody)
+            await using var recent = new MySqlCommand(
+                $"SELECT body FROM {Manifests} WHERE platform = @p ORDER BY published DESC LIMIT 2", connection);
+            recent.Parameters.AddWithValue("@p", p);
+            await using var reader = await recent.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
             {
-                foreach (var sha in ManifestReader.ReferencedShas(previousBody))
+                foreach (var sha in ManifestReader.ReferencedShas(reader.GetString(0)))
                 {
                     keep.Add(sha);
                 }
@@ -355,11 +393,11 @@ public sealed class SqlUpdateStore : IUpdateStore
             }
         }
 
-        // Histórico de manifestos: os 5 últimos bastam.
+        // Histórico de manifestos: os 5 últimos de cada plataforma bastam.
         await ExecAsync(connection, $"""
-            DELETE FROM {Manifests} WHERE published < (
-                SELECT published FROM (SELECT published FROM {Manifests} ORDER BY published DESC LIMIT 1 OFFSET 4) AS t)
-            """);
+            DELETE FROM {Manifests} WHERE platform = @p AND published < (
+                SELECT published FROM (SELECT published FROM {Manifests} WHERE platform = @p ORDER BY published DESC LIMIT 1 OFFSET 4) AS t)
+            """, ("@p", platform));
     }
 }
 

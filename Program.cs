@@ -233,9 +233,9 @@ bool IsAdmin(HttpRequest http)
 bool IsValidFile(string sha, string name) =>
     shaPattern.IsMatch(sha) && namePattern.IsMatch(name) && name != "." && name != "..";
 
-app.MapMethods("/updates/manifest.json", ["GET", "HEAD"], async (HttpResponse response) =>
+async Task<IResult> ServeManifest(HttpResponse response, string platform)
 {
-    var manifest = await updates.ReadManifestAsync();
+    var manifest = await updates.ReadManifestAsync(platform);
     if (manifest is null)
     {
         return Results.NotFound();
@@ -243,7 +243,24 @@ app.MapMethods("/updates/manifest.json", ["GET", "HEAD"], async (HttpResponse re
 
     response.Headers.CacheControl = "no-cache";
     return Results.Text(manifest, "application/json", Encoding.UTF8);
+}
+
+// Windows fica no endereço de sempre (launchers antigos já instalados leem daqui).
+app.MapMethods("/updates/manifest.json", ["GET", "HEAD"],
+    (HttpResponse response) => ServeManifest(response, UpdatePlatforms.Windows));
+app.MapMethods("/updates/linux/manifest.json", ["GET", "HEAD"],
+    (HttpResponse response) => ServeManifest(response, UpdatePlatforms.Linux));
+
+// Linux: `curl -fsSL https://.../linux | bash` instala o launcher (baixa do manifesto do Linux,
+// confere a assinatura e cria o atalho no menu). O script vem com o endereço deste serviço.
+var linuxDir = Path.Combine(AppContext.BaseDirectory, "linux");
+app.MapGet("/linux", async (HttpRequest request) =>
+{
+    var script = await File.ReadAllTextAsync(Path.Combine(linuxDir, "install.sh"));
+    var baseUrl = $"{request.Scheme}://{request.Host}";
+    return Results.Text(script.Replace("{{BASE_URL}}", baseUrl), "text/x-shellscript", Encoding.UTF8);
 });
+app.MapGet("/linux/icon.png", () => Results.File(Path.Combine(linuxDir, "icon.png"), "image/png"));
 
 app.MapMethods("/updates/files/{sha}/{name}", ["GET", "HEAD"], async (string sha, string name, HttpRequest request, HttpResponse response, CancellationToken ct) =>
 {
@@ -302,6 +319,12 @@ app.MapPut("/admin/manifest", async (HttpRequest http) =>
         return Results.Unauthorized();
     }
 
+    var platform = http.Query["platform"].ToString() is { Length: > 0 } p ? p : UpdatePlatforms.Windows;
+    if (!UpdatePlatforms.IsValid(platform))
+    {
+        return Results.BadRequest(new { error = "plataforma inválida" });
+    }
+
     using var reader = new StreamReader(http.Body, Encoding.UTF8);
     var body = await reader.ReadToEndAsync();
 
@@ -325,8 +348,8 @@ app.MapPut("/admin/manifest", async (HttpRequest http) =>
         }
     }
 
-    await updates.WriteManifestAsync(body, entries.Select(e => e.Sha).ToList());
-    log.LogInformation("Novo manifesto publicado ({Count} arquivos)", entries.Count);
+    await updates.WriteManifestAsync(body, entries.Select(e => e.Sha).ToList(), platform);
+    log.LogInformation("Novo manifesto publicado para {Platform} ({Count} arquivos)", platform, entries.Count);
     return Results.Ok();
 });
 
