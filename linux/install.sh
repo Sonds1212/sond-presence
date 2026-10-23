@@ -112,5 +112,9 @@ ln -sf "$APP_DIR/SondClient" "$BIN_LINK"
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$(dirname "$DESKTOP_FILE")" >/dev/null 2>&1 || true
 
 printf '\n\033[1;32m✓ Sond Client %s instalado!\033[0m\n' "$VERSION"
-printf '  Abra pelo menu de aplicativos ("Sond Client") ou rode: sondclient\n'
+case ":$PATH:" in
+    *":$HOME/.local/bin:"*) printf '  Abra pelo menu de aplicativos ("Sond Client") ou rode: sondclient\n' ;;
+    # Usuário novo: ~/.local/bin só entra no PATH no próximo login.
+    *) printf '  Abra pelo menu de aplicativos ("Sond Client") ou rode: %s\n' "$BIN_LINK" ;;
+esac
 printf '  O launcher se atualiza sozinho daqui pra frente.\n'

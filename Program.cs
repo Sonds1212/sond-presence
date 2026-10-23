@@ -262,6 +262,24 @@ app.MapGet("/linux", async (HttpRequest request) =>
 });
 app.MapGet("/linux/icon.png", () => Results.File(Path.Combine(linuxDir, "icon.png"), "image/png"));
 
+// Arquivos para baixar no PC com Linux (sem precisar de terminal):
+// .deb (Ubuntu, Mint, Pop!_OS, Debian — dois cliques) e o instalador .sh para as outras distros.
+app.MapGet("/download/linux", async () =>
+{
+    var manifest = await updates.ReadManifestAsync(UpdatePlatforms.Linux);
+    var installer = manifest is null ? null : ManifestReader.Installer(manifest);
+    return installer is null
+        ? Results.NotFound("Nenhum pacote Linux publicado ainda.")
+        : Results.Redirect($"/updates/files/{installer.Value.Sha}/{installer.Value.Name}");
+});
+app.MapGet("/download/linux.sh", async (HttpRequest request) =>
+{
+    var script = await File.ReadAllTextAsync(Path.Combine(linuxDir, "install.sh"));
+    var baseUrl = $"{request.Scheme}://{request.Host}";
+    return Results.File(Encoding.UTF8.GetBytes(script.Replace("{{BASE_URL}}", baseUrl)),
+        "application/x-sh", "instalar-sond-client.sh");
+});
+
 app.MapMethods("/updates/files/{sha}/{name}", ["GET", "HEAD"], async (string sha, string name, HttpRequest request, HttpResponse response, CancellationToken ct) =>
 {
     if (!IsValidFile(sha, name))
