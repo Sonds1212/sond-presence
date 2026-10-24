@@ -86,10 +86,12 @@ else
 }
 
 // Atualizações: no banco quando há banco (hospedagem grátis apaga o disco), senão em disco.
+// Updates:Store=disk força o disco mesmo com banco (VPS com disco próprio: o banco fica só com os dados).
 var updatesDir = Path.GetFullPath(builder.Configuration["Updates:Directory"] is { Length: > 0 } d
     ? d
     : Path.Combine(builder.Environment.ContentRootPath, "updates"));
-IUpdateStore updates = !string.IsNullOrWhiteSpace(sqlConnection)
+var updatesOnDisk = string.Equals(builder.Configuration["Updates:Store"], "disk", StringComparison.OrdinalIgnoreCase);
+IUpdateStore updates = !string.IsNullOrWhiteSpace(sqlConnection) && !updatesOnDisk
     ? new SqlUpdateStore(sqlConnection, "sond_", Path.Combine(Path.GetTempPath(), "sond-update-cache"))
     : new DiskUpdateStore(updatesDir);
 await updates.InitializeAsync();
@@ -233,6 +235,26 @@ bool IsAdmin(HttpRequest http)
 bool IsValidFile(string sha, string name) =>
     shaPattern.IsMatch(sha) && namePattern.IsMatch(name) && name != "." && name != "..";
 
+// Links externos dos manifestos atuais (Windows + Linux), relidos quando um manifesto novo é publicado.
+Dictionary<string, string>? externalUrls = null;
+async Task<string?> ExternalUrlAsync(string sha)
+{
+    var map = externalUrls;
+    if (map is null)
+    {
+        map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var platform in new[] { UpdatePlatforms.Windows, UpdatePlatforms.Linux })
+        {
+            if (await updates.ReadManifestAsync(platform) is { } manifest)
+            {
+                foreach (var (hash, url) in ManifestReader.ExternalUrls(manifest)) map[hash] = url;
+            }
+        }
+        externalUrls = map;
+    }
+    return map.GetValueOrDefault(sha);
+}
+
 async Task<IResult> ServeManifest(HttpResponse response, string platform)
 {
     var manifest = await updates.ReadManifestAsync(platform);
@@ -302,6 +324,13 @@ app.MapMethods("/updates/files/{sha}/{name}", ["GET", "HEAD"], async (string sha
         return await updates.HasFileAsync(sha) ? Results.Ok() : Results.NotFound();
     }
 
+    // Arquivo hospedado no GitHub Releases: só redireciona (a banda do plano grátis do Render
+    // é pequena; launchers e instaladores seguem o redirecionamento sozinhos).
+    if (await ExternalUrlAsync(sha) is { } external)
+    {
+        return Results.Redirect(external);
+    }
+
     var path = await updates.GetLocalPathAsync(sha, name, ct);
     if (path is null)
     {
@@ -367,15 +396,18 @@ app.MapPut("/admin/manifest", async (HttpRequest http) =>
         return Results.BadRequest(new { error = "manifesto inválido: " + ex.Message });
     }
 
+    // Arquivos com link externo (GitHub Releases) não precisam estar guardados aqui.
+    var external = ManifestReader.ExternalUrls(body);
     foreach (var (sha, name) in entries)
     {
-        if (!IsValidFile(sha, name) || !await updates.HasFileAsync(sha))
+        if (!IsValidFile(sha, name) || (!external.ContainsKey(sha) && !await updates.HasFileAsync(sha)))
         {
             return Results.BadRequest(new { error = $"arquivo não enviado: {name}" });
         }
     }
 
-    await updates.WriteManifestAsync(body, entries.Select(e => e.Sha).ToList(), platform);
+    await updates.WriteManifestAsync(body, entries.Where(e => !external.ContainsKey(e.Sha)).Select(e => e.Sha).ToList(), platform);
+    externalUrls = null;
     log.LogInformation("Novo manifesto publicado para {Platform} ({Count} arquivos)", platform, entries.Count);
     return Results.Ok();
 });

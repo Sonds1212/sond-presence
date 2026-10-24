@@ -470,6 +470,49 @@ public static class ManifestReader
     private static (string, string) Entry(System.Text.Json.JsonElement file) =>
         (file.GetProperty("sha256").GetString() ?? "", Path.GetFileName(file.GetProperty("path").GetString() ?? ""));
 
+    /// <summary>
+    /// hash → link externo (GitHub Releases) dos arquivos que o SondPublish hospedou fora daqui.
+    /// Esses o serviço não guarda: só redireciona, e a banda do download não passa pelo Render.
+    /// </summary>
+    public static Dictionary<string, string> ExternalUrls(string envelopeJson)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            using var envelope = System.Text.Json.JsonDocument.Parse(envelopeJson);
+            var payload = Convert.FromBase64String(envelope.RootElement.GetProperty("manifest").GetString()!);
+            using var manifest = System.Text.Json.JsonDocument.Parse(payload);
+
+            void Add(System.Text.Json.JsonElement file)
+            {
+                if (file.ValueKind == System.Text.Json.JsonValueKind.Object &&
+                    file.TryGetProperty("url", out var url) && url.GetString() is { Length: > 0 } link &&
+                    link.StartsWith("https://", StringComparison.OrdinalIgnoreCase) &&
+                    file.TryGetProperty("sha256", out var sha) && sha.GetString() is { Length: > 0 } hash)
+                {
+                    result[hash] = link;
+                }
+            }
+
+            foreach (var name in new[] { "files", "downloads" })
+            {
+                if (manifest.RootElement.TryGetProperty(name, out var list) && list.ValueKind == System.Text.Json.JsonValueKind.Array)
+                {
+                    foreach (var file in list.EnumerateArray()) Add(file);
+                }
+            }
+            if (manifest.RootElement.TryGetProperty("installer", out var installer))
+            {
+                Add(installer);
+            }
+        }
+        catch
+        {
+            // manifesto antigo ou inválido: sem links externos
+        }
+        return result;
+    }
+
     public static IEnumerable<string> ReferencedShas(string envelopeJson)
     {
         try
